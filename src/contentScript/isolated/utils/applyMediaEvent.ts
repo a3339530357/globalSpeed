@@ -6,6 +6,7 @@ import { CinemaInit, MediaProbe, StateOption } from "../../../types"
 import { clamp, formatDuration, round } from "../../../utils/helper"
 import { Cinema } from "./Cinema"
 import { IS_AMAZON, IS_BILIBILI, IS_NATIVE, IS_NETFLIX, IS_SMART, IS_SPECIAL_SEEK, IS_YOUTUBE } from "./isWebsite"
+import { DouyinSeekMessage, getDouyinSeekIndex } from "./siteAdapters/douyin"
 
 export function getMediaProbe(media: HTMLMediaElement, includeFormatted?: boolean): MediaProbe {
 	if (!media) return
@@ -20,7 +21,8 @@ export function seek(elem: HTMLMediaElement, value: number, relative: boolean, a
 
 	if (relative) {
 		if (elem instanceof HTMLVideoElement && Math.abs(value).toFixed(4) === "0.0410") {
-			if (elem.seekToNextFrame && value >= 0 && !IS_SPECIAL_SEEK) {
+			// A MediaStream has no frame to step to, so fall through to the fps estimate.
+			if (elem.seekToNextFrame && value >= 0 && !IS_SPECIAL_SEEK && !elem.srcObject) {
 				elem.seekToNextFrame()
 				return
 			}
@@ -30,7 +32,18 @@ export function seek(elem: HTMLMediaElement, value: number, relative: boolean, a
 				value = value >= 0 ? 1 / fps : -(1 / fps)
 			}
 		}
+	}
 
+	// Douyin's WebCodecs players cannot be sought through the element. Hand the request
+	// to the main world, which resolves it against the decoder's own position, since
+	// this world only sees the MediaStream's clock.
+	const douyinIndex = getDouyinSeekIndex(elem)
+	if (douyinIndex >= 0) {
+		gvar.os.stratumServer.send({ type: "DOUYIN_SEEK", index: douyinIndex, value, relative } satisfies DouyinSeekMessage)
+		return
+	}
+
+	if (relative) {
 		newTime = elem.currentTime + value
 
 		if (wraparound && elem.duration > 60) {
@@ -55,6 +68,13 @@ export function seekTo(elem: HTMLMediaElement, value: number, autoPause?: boolea
 			type: "SEEK_NETFLIX",
 			value,
 		})
+		return
+	}
+
+	// Marks, loops and other absolute jumps reach the decoder the same way.
+	const douyinIndex = getDouyinSeekIndex(elem)
+	if (douyinIndex >= 0) {
+		gvar.os.stratumServer.send({ type: "DOUYIN_SEEK", index: douyinIndex, value, relative: false } satisfies DouyinSeekMessage)
 		return
 	}
 
@@ -390,7 +410,9 @@ export function applyMediaEvent(elem: HTMLMediaElement, e: MediaEvent) {
 		return
 	}
 
-	if (!elem?.duration) return
+	// A MediaStream player reports no duration, yet a site adapter can still seek its
+	// decoder, so seeks must not be dropped here.
+	if (!elem?.duration && !(elem?.srcObject && e.type === "SEEK")) return
 	if (e.type === "PLAYBACK_RATE") {
 		SetPlaybackRate.set(elem, e.value, e.freePitch)
 	} else if (e.type === "SEEK") {
